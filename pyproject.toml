@@ -1,5 +1,60 @@
+[project]
+name = "mm_dinov2"
+version = "1.0.0"
+requires-python = "~=3.10.0"
+dependencies = [
+  "cuml-cu11",
+  "fvcore>=0.1.5.post20221221",
+  "h5py>=3.13.0",
+  "iopath>=0.1.10",
+  "matplotlib",
+  "ml-collections",
+  "monai",
+  "nibabel",
+  "omegaconf",
+  "open-clip-torch",
+  "peft",
+  "protobuf",
+  "scikit-image",
+  "scikit-learn",
+  "scikit-multilearn>=0.2.0",
+  "scipy",
+  "seaborn~=0.13.2",
+  "submitit",
+  "torch==2.0.0",
+  "torchio",
+  "torchmetrics==1.6",
+  "torchvision",
+  "torchxrayvision",
+  "transformers<4.50",
+  "wandb",
+  "xformers==0.0.18"
+]
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com"
+[[tool.uv.index]]
+name = "pytorch-cu117"
+url = "https://download.pytorch.org/whl/cu117"
+explicit = true
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dinov2"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu117", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+]
+torchvision = [
+  { index = "pytorch-cu117", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+]
+
 [tool.black]
-line-length = 120
+line-length = 100
 
 [tool.pylint.master]
 persistent = false
@@ -7,10 +62,7 @@ score = false
 
 [tool.pylint.messages_control]
 disable = "all"
-enable = [
-  "miscellaneous",
-  "similarities",
-]
+enable = ["miscellaneous", "similarities"]
 
 [tool.pylint.similarities]
 ignore-comments = true
@@ -22,8 +74,7 @@ min-similarity-lines = 8
 reports = false
 
 [tool.pylint.miscellaneous]
-notes = [
-  "FIXME",
-  "XXX",
-  "TODO",
-]
+notes = ["FIXME", "XXX", "TODO"]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.14.2"]

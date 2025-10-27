@@ -1,16 +1,74 @@
+# ==== Python artifact & runtime cache ====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Byte-compiled / optimized / DLL files
+*.so
+
+# Pytest
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# ==== Packaging / distribution ====
 build/
 dist/
 *.egg-info/
-**/__pycache__/
+*.egg
+pip-wheel-metadata/
+*.whl
 
-models/*
-results/*
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
-**/.ipynb_checkpoints
-**/.ipynb_checkpoints/**
+# ==== Virtual environments / env files ====
+venv/
+env/
+.venv/
+ENV/
+.env
+.env.*
 
-**/notebooks
+# ==== Notebooks ====
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
 
-*.swp
-
+# ==== IDE / Editor ====
 .vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ==== OS generated files ====
+.DS_Store
+Thumbs.db
+
+# ==== Logs & temporary outputs ====
+logs/
+**/logs/
+*.log
+out/
+
+# ==== Model weights / large binaries ====
+# Keep model source and small checkpoints under version control as desired.
+models/
+models/*
+*.pth
+
+# ==== Experiment tracking ====
+wandb/
+
+# ==== Junk / misc ====
+*.swp
+*.tmp
+
+# Optionally ignored by-project - adjust if you need to track these folders/files
+# **/notebooks

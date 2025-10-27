@@ -1,5 +1,5 @@
 MODEL:
-  WEIGHTS: ''
+  WEIGHTS: ""
 compute_precision:
   grad_scaler: true
   teacher:
@@ -51,13 +51,18 @@ ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5
   mask_ratio_min_max:
-  - 0.1
-  - 0.5
+    - 0.1
+    - 0.5
   separate_head: false
   head_n_prototypes: 65536
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
+  mask_per_channel: False
+semi_supervised:
+  loss_weight: 0.0
+  label_smoothing: 0.1
+  temperature: 0.1
 train:
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
@@ -68,34 +73,40 @@ train:
   OFFICIAL_EPOCH_LENGTH: 1250
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
+  img_size: 518
+  percentage_labels: 1.0
 student:
   arch: vit_large
   patch_size: 16
   drop_path_rate: 0.3
   layerscale: 1.0e-05
   drop_path_uniform: true
-  pretrained_weights: ''
+  pretrained_weights: ""
   ffn_layer: "mlp"
   block_chunks: 0
   qkv_bias: true
   proj_bias: true
   ffn_bias: true
+  use_mri_seq_embed: False
+  img_wise_pos_embed: True
 teacher:
   momentum_teacher: 0.992
   final_momentum_teacher: 1
   warmup_teacher_temp: 0.04
   teacher_temp: 0.07
   warmup_teacher_temp_epochs: 30
+  init_with_student_weights: False
 optim:
   epochs: 100
   weight_decay: 0.04
   weight_decay_end: 0.4
-  base_lr: 0.004  # learning rate for a batch size of 1024
-  lr: 0.  # will be set after applying scaling rule
+  base_lr: 0.004 # learning rate for a batch size of 1024
+  lr: 0. # will be set after applying scaling rule
   warmup_epochs: 10
   min_lr: 1.0e-06
   clip_grad: 3.0
   freeze_last_layer_epochs: 1
+  freeze_backbone_epochs: 0
   scaling_rule: sqrt_wrt_1024
   patch_embed_lr_mult: 0.2
   layerwise_decay: 0.9
@@ -103,13 +114,19 @@ optim:
   adamw_beta2: 0.999
 crops:
   global_crops_scale:
-  - 0.32
-  - 1.0
+    - 0.32
+    - 1.0
   local_crops_number: 8
   local_crops_scale:
-  - 0.05
-  - 0.32
+    - 0.05
+    - 0.32
   global_crops_size: 224
   local_crops_size: 96
+  intensity_aug: color_jittering
+  max_blur_radius: 1
+  gamma_range:
+    - 0.75
+    - 1.5
+  crop_from_tumor_foreground: False
 evaluation:
   eval_period_iterations: 12500

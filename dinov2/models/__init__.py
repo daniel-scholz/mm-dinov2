@@ -8,11 +8,10 @@ import logging
 
 from . import vision_transformer as vits
 
-
 logger = logging.getLogger("dinov2")
 
 
-def build_model(args, only_teacher=False, img_size=224):
+def build_model(args, only_teacher=False, img_size=224, **kwargs):
     args.arch = args.arch.removesuffix("_memeff")
     if "vit" in args.arch:
         vit_kwargs = dict(
@@ -25,11 +24,12 @@ def build_model(args, only_teacher=False, img_size=224):
             proj_bias=args.proj_bias,
             ffn_bias=args.ffn_bias,
         )
-        teacher = vits.__dict__[args.arch](**vit_kwargs)
+        teacher = vits.__dict__[args.arch](**vit_kwargs, **kwargs)
         if only_teacher:
             return teacher, teacher.embed_dim
         student = vits.__dict__[args.arch](
             **vit_kwargs,
+            **kwargs,
             drop_path_rate=args.drop_path_rate,
             drop_path_uniform=args.drop_path_uniform,
         )
@@ -38,4 +38,18 @@ def build_model(args, only_teacher=False, img_size=224):
 
 
 def build_model_from_cfg(cfg, only_teacher=False):
-    return build_model(cfg.student, only_teacher=only_teacher, img_size=cfg.crops.global_crops_size)
+    kwargs = {}
+    if (
+        cfg.student.arch.startswith("glioma_vit")
+        and "mri_sequences" in cfg.train.dataset_path
+    ):
+        mri_sequences = (
+            cfg.train.dataset_path.split("mri_sequences=")[1].split(":")[0].split(",")
+        )
+        kwargs["mri_sequences"] = mri_sequences
+        kwargs["use_mri_seq_embed"] = cfg.student.use_mri_seq_embed
+        kwargs["img_wise_pos_embed"] = cfg.student.img_wise_pos_embed
+
+    return build_model(
+        cfg.student, only_teacher=only_teacher, img_size=cfg.train.img_size, **kwargs
+    )

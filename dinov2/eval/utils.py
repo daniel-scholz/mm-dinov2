@@ -4,30 +4,39 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import ast
 import logging
-from typing import Dict, Optional
 from builtins import range
+from functools import partial
+from typing import Dict, Optional
 
+import numpy as np
+import scipy.sparse as sparse
+import torch
+import torchvision
+from monai.networks.nets.resnet import resnet34
+from open_clip import create_model_from_pretrained
 from sklearn.neighbors import NearestNeighbors
 from skmultilearn.base import MLClassifierBase
 from skmultilearn.utils import get_matrix_in_format
-from transformers import ViTForImageClassification, SamModel, CLIPModel, ViTMSNModel
-from open_clip import create_model_from_pretrained, get_tokenizer
-import ast
-import numpy as np
-import scipy.sparse as sparse
-
-import torch
 from torch import nn
-import torchvision
 from torchmetrics import MetricCollection
+from torchvision.models.convnext import LayerNorm2d
+from torchvision.ops.misc import Conv2dNormActivation
+from tqdm import tqdm
+from transformers import CLIPModel, SamModel, ViTForImageClassification, ViTMSNModel
 
-from dinov2.data import DatasetWithEnumeratedTargets, SamplerType, make_data_loader, make_dataset
 import dinov2.distributed as distributed
+from dinov2.data import (
+    DatasetWithEnumeratedTargets,
+    SamplerType,
+    make_data_loader,
+    make_dataset,
+)
 from dinov2.logging import MetricLogger
 
-
 logger = logging.getLogger("dinov2")
+
 
 class Model3DWrapper(nn.Module):
     def __init__(self, model, per_slice=False) -> None:
@@ -37,17 +46,18 @@ class Model3DWrapper(nn.Module):
 
     def forward(self, x):
         batch_outputs = []
-        for slices in x: 
+        for slices in x:
             if self.per_slice:
                 batch_outputs.append(
-                    torch.stack([self.model(slice_) for slice_ in slices], dim=0).squeeze()
+                    torch.stack(
+                        [self.model(slice_) for slice_ in slices], dim=0
+                    ).squeeze()
                 )
             else:
-                batch_outputs.append(
-                    self.model(slices)
-                )
+                batch_outputs.append(self.model(slices))
         batch_outputs = torch.stack(batch_outputs, dim=0)
         return batch_outputs
+
 
 class ModelWithNormalize(torch.nn.Module):
     def __init__(self, model):
@@ -56,11 +66,14 @@ class ModelWithNormalize(torch.nn.Module):
 
     def forward(self, samples):
         return nn.functional.normalize(self.model(samples), dim=1, p=2)
-    
+
+
 class ViTLargeImagenet21k(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = ViTForImageClassification.from_pretrained('google/vit-large-patch16-224')
+        self.model = ViTForImageClassification.from_pretrained(
+            "google/vit-large-patch16-224"
+        )
         self.embed_dim = 1024
         self.patch_size = 16
         self.norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
@@ -69,29 +82,28 @@ class ViTLargeImagenet21k(nn.Module):
         output = self.model.forward(x, output_hidden_states=True)
         cls = output.hidden_states[-1][:, 0]
         return cls
-    
+
     def forward_features(self, x, masks=None):
-        
         layer_features = self.model.forward(x, output_hidden_states=True)
 
         patch_tokens = layer_features.hidden_states[-1]
         patch_tokens = patch_tokens[:, 1:]
 
-
         x_norm_patch = self.norm(patch_tokens)
         return {
             "x_norm_patchtokens": x_norm_patch,
         }
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         layer_features = self.model.forward(x, output_hidden_states=True)
-        outputs = layer_features.hidden_states[-n_last_blocks: ]
+        outputs = layer_features.hidden_states[-n_last_blocks:]
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1:] for out in outputs]
         if return_class_token:
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
-    
+
+
 class ViTLargeMSN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -104,23 +116,21 @@ class ViTLargeMSN(nn.Module):
         output = self.model.forward(x, output_hidden_states=True)
         cls = output.hidden_states[-1][:, 0]
         return cls
-    
+
     def forward_features(self, x, masks=None):
-        
         layer_features = self.model.forward(x, output_hidden_states=True)
 
         patch_tokens = layer_features.hidden_states[-1]
         patch_tokens = patch_tokens[:, 1:]
 
-
         x_norm_patch = self.norm(patch_tokens)
         return {
             "x_norm_patchtokens": x_norm_patch,
         }
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         layer_features = self.model.forward(x, output_hidden_states=True)
-        outputs = layer_features.hidden_states[-n_last_blocks: ]
+        outputs = layer_features.hidden_states[-n_last_blocks:]
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1:] for out in outputs]
         if return_class_token:
@@ -131,7 +141,7 @@ class ViTLargeMSN(nn.Module):
 class CLIPLarge(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = CLIPModel.from_pretrained('openai/clip-vit-large-patch14')
+        self.model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
         self.model = self.model.vision_model
         self.embed_dim = 1024
         self.patch_size = 14
@@ -141,9 +151,8 @@ class CLIPLarge(nn.Module):
         output = self.model.forward(x, output_hidden_states=True)
         cls = output.hidden_states[-1][:, 0]
         return cls
-    
+
     def forward_features(self, x, masks=None):
-        
         layer_features = self.model.forward(x, output_hidden_states=True)
 
         patch_tokens = layer_features.hidden_states[-1]
@@ -153,20 +162,21 @@ class CLIPLarge(nn.Module):
         return {
             "x_norm_patchtokens": x_norm_patch,
         }
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         layer_features = self.model.forward(x, output_hidden_states=True)
-        outputs = layer_features.hidden_states[-n_last_blocks: ]
+        outputs = layer_features.hidden_states[-n_last_blocks:]
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1:] for out in outputs]
         if return_class_token:
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
 
+
 class OpenCLIPHuge(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = CLIPModel.from_pretrained('laion/CLIP-ViT-H-14-laion2B-s32B-b79K')
+        self.model = CLIPModel.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
         self.model = self.model.vision_model
         self.embed_dim = 1280
         self.patch_size = 14
@@ -176,9 +186,8 @@ class OpenCLIPHuge(nn.Module):
         output = self.model.forward(x, output_hidden_states=True)
         cls = output.hidden_states[-1][:, 0]
         return cls
-    
+
     def forward_features(self, x, masks=None):
-        
         layer_features = self.model.forward(x, output_hidden_states=True)
 
         patch_tokens = layer_features.hidden_states[-1]
@@ -188,20 +197,23 @@ class OpenCLIPHuge(nn.Module):
         return {
             "x_norm_patchtokens": x_norm_patch,
         }
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         layer_features = self.model.forward(x, output_hidden_states=True)
-        outputs = layer_features.hidden_states[-n_last_blocks: ]
+        outputs = layer_features.hidden_states[-n_last_blocks:]
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1:] for out in outputs]
         if return_class_token:
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
 
+
 class BiomedCLIPBase(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model, _ = create_model_from_pretrained('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+        self.model, _ = create_model_from_pretrained(
+            "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+        )
         self.model = self.model.visual
         self.embed_dim = 512
         self.norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
@@ -209,15 +221,16 @@ class BiomedCLIPBase(nn.Module):
     def forward(self, x):
         cls = self.model(x)
         return cls
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         outputs = self.model(x)
         return [(None, outputs)]
 
+
 class MAEViTLargeImagenet1k(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = ViTForImageClassification.from_pretrained('facebook/vit-mae-large')
+        self.model = ViTForImageClassification.from_pretrained("facebook/vit-mae-large")
         self.embed_dim = 1024
         self.patch_size = 16
         self.norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
@@ -226,9 +239,8 @@ class MAEViTLargeImagenet1k(nn.Module):
         output = self.model.forward(x, output_hidden_states=True)
         cls = output.hidden_states[-1][:, 0]
         return cls
-    
+
     def forward_features(self, x, masks=None):
-        
         layer_features = self.model.forward(x, output_hidden_states=True)
 
         patch_tokens = layer_features.hidden_states[-1]
@@ -238,30 +250,64 @@ class MAEViTLargeImagenet1k(nn.Module):
         return {
             "x_norm_patchtokens": x_norm_patch,
         }
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         layer_features = self.model.forward(x, output_hidden_states=True)
-        outputs = layer_features.hidden_states[-n_last_blocks: ]
+        outputs = layer_features.hidden_states[-n_last_blocks:]
         class_tokens = [out[:, 0] for out in outputs]
         outputs = [out[:, 1:] for out in outputs]
         if return_class_token:
             return tuple(zip(outputs, class_tokens))
         return tuple(outputs)
-    
-class ResNet152ImageNet1k(nn.Module):
-    def __init__(self):
+
+
+class ResNet34FromScratch(nn.Module):
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.model = torchvision.models.resnet152(weights=torchvision.models.ResNet152_Weights.DEFAULT)
+        self.model = resnet34(
+            spatial_dims=2,
+            n_input_channels=in_channels,
+        )
         self.model.fc = torch.nn.Identity()
 
     def forward(self, x):
         output = self.model(x)
         return output
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         outputs = self.model(x)
         return [(None, outputs)]
-    
+
+
+class ConvNextFromScratch(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.model = torchvision.models.convnext_tiny()
+        # replace features layer for num
+        to_replace_layer = self.model.features[0]
+        keep_layer = self.model.features[1:]
+        norm_layer = partial(LayerNorm2d, eps=1e-6)
+        new_first_layer = Conv2dNormActivation(
+            in_channels=in_channels,
+            out_channels=to_replace_layer.out_channels,
+            kernel_size=4,
+            stride=4,
+            padding=0,
+            norm_layer=norm_layer,
+            activation_layer=None,
+            bias=True,
+        )
+
+        self.model.features = torch.nn.Sequential(new_first_layer, *keep_layer)
+
+    def forward(self, x):
+        return self.model.features(x)
+
+    def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
+        outputs = self.model(x)
+        return [(None, outputs)]
+
+
 class SAMLarge(nn.Module):
     def __init__(self):
         super().__init__()
@@ -275,42 +321,50 @@ class SAMLarge(nn.Module):
         output = output.last_hidden_state.view(batch, 64 * 64, 1024)
         output = output.mean(dim=1)
         return output
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         outputs = self.forward(x)
         return [(None, outputs)]
 
+
 class DenseNet201ImageNet1k(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = torchvision.models.densenet201(weights=torchvision.models.DenseNet201_Weights.DEFAULT)
+        self.model = torchvision.models.densenet201(
+            weights=torchvision.models.DenseNet201_Weights.DEFAULT
+        )
         self.model.classifier = torch.nn.Identity()
 
     def forward(self, x):
         output = self.model(x)
         return output
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         outputs = self.model(x)
         return [(None, outputs)]
 
+
 class VGG19ImageNet1k(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = torchvision.models.vgg19(weights=torchvision.models.VGG19_Weights.DEFAULT)
+        self.model = torchvision.models.vgg19(
+            weights=torchvision.models.VGG19_Weights.DEFAULT
+        )
         self.model.classifier[6] = torch.nn.Identity()
 
     def forward(self, x):
         output = self.model(x)
         return output
-    
+
     def get_intermediate_layers(self, x, n_last_blocks, return_class_token=True):
         outputs = self.model(x)
         return [(None, outputs)]
 
 
 class ModelWithIntermediateLayers(nn.Module):
-    def __init__(self, feature_model, n_last_blocks, autocast_ctx, is_3d=True, fine_tune=False):
+    def __init__(
+        self, feature_model, n_last_blocks, autocast_ctx, is_3d=True, fine_tune=False
+    ):
         super().__init__()
         self.feature_model = feature_model
         self.fine_tune = fine_tune
@@ -321,15 +375,6 @@ class ModelWithIntermediateLayers(nn.Module):
         self.n_last_blocks = n_last_blocks
         self.autocast_ctx = autocast_ctx
         self.is_3d = is_3d
-
-    def forward_3d(self, images):
-        batch_features = [] 
-        for batch_scans in images: # calculate the features for every scan in all scans of the batch
-            scans = []
-            for scan in batch_scans:
-                if not is_padded_matrix(scan): scans.append(self.forward_(scan.unsqueeze(0)))
-            batch_features.append(scans)
-        return batch_features
 
     def forward_(self, images):
         with self.autocast_ctx():
@@ -343,13 +388,14 @@ class ModelWithIntermediateLayers(nn.Module):
                         images, self.n_last_blocks, return_class_token=True
                     )
         return features
-    
+
     def forward(self, images):
-        if self.is_3d: return self.forward_3d(images)
+        if self.is_3d:
+            return self.forward_3d(images)
         return [self.forward_(images)]
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate(
     model: nn.Module,
     data_loader,
@@ -362,14 +408,13 @@ def evaluate(
     if criterion is not None:
         criterion.eval()
 
-    for metric in metrics.values():
-        metric = metric.to(device)
+    for metric_collection in metrics.values():
+        metric_collection = metric_collection.to(device)
 
     metric_logger = MetricLogger(delimiter="  ")
     header = "Test:"
 
     for samples, targets, *_ in metric_logger.log_every(data_loader, 10, header):
-        
         outputs = model(samples.to(device))
         if isinstance(targets, torch.Tensor):
             targets = targets.to(device)
@@ -378,15 +423,19 @@ def evaluate(
             loss = criterion(outputs, targets)
             metric_logger.update(loss=loss.item())
 
-        for k, metric in metrics.items():
+        for k, metric_collection in metrics.items():
             metric_inputs = postprocessors[k](outputs, targets)
-            metric.update(**metric_inputs)
+            metric_collection.update(**metric_inputs)
 
     metric_logger.synchronize_between_processes()
     logger.info(f"Averaged stats: {metric_logger}")
 
-    stats = apply_method_to_nested_values(metrics, "compute", nested_types=(MetricCollection, dict))
-    metric_logger_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats = apply_method_to_nested_values(
+        metrics, "compute", nested_types=(MetricCollection, dict)
+    )
+    metric_logger_stats = {
+        k: meter.global_avg for k, meter in metric_logger.meters.items()
+    }
     return metric_logger_stats, stats
 
 
@@ -402,7 +451,9 @@ def all_gather_and_flatten(tensor_rank):
     return tensor_all_ranks.flatten(end_dim=1)
 
 
-def extract_features(model, dataset, batch_size, num_workers, gather_on_cpu=False):
+def extract_features(
+    model, dataset, batch_size, num_workers, gather_on_cpu=False, mri_sequences=None
+):
     dataset_with_enumerated_targets = DatasetWithEnumeratedTargets(dataset)
     sample_count = len(dataset_with_enumerated_targets)
     data_loader = make_data_loader(
@@ -413,27 +464,91 @@ def extract_features(model, dataset, batch_size, num_workers, gather_on_cpu=Fals
         drop_last=False,
         shuffle=False,
     )
-    return extract_features_with_dataloader(model, data_loader, sample_count, gather_on_cpu)
+    return extract_features_with_dataloader(
+        model, data_loader, sample_count, gather_on_cpu, mri_sequences
+    )
 
 
-@torch.inference_mode()
-def extract_features_with_dataloader(model, data_loader, sample_count, gather_on_cpu=False):
+@torch.no_grad()
+def extract_features_with_dataloader(
+    model, data_loader, sample_count, gather_on_cpu=False, mri_sequences=None
+):
     gather_device = torch.device("cpu") if gather_on_cpu else torch.device("cuda")
     metric_logger = MetricLogger(delimiter="  ")
     features, all_labels = None, None
-    for samples, (index, labels_rank) in metric_logger.log_every(data_loader, 10):
+    # we need to mask the MRI sequences not in mri_sequences
+    if mri_sequences is not None:
+        assert hasattr(model, "mri_sequences")
+        if mri_sequences == "random":
+            # randomly drop one MRI sequence
+            mri_sequence_used_mask = torch.ones(len(model.mri_sequences)).bool()
+        else:
+            # mask indiciating which MRI sequences should be used for feature extraction
+            mri_sequence_used_mask = torch.tensor(
+                [mri_sequence in mri_sequences for mri_sequence in model.mri_sequences]
+            )
+            mri_sequence_used_mask = mri_sequence_used_mask.cuda()
+    else:
+        # all MRI sequences are used
+        mri_sequence_used_mask = None
+
+    for samples, (index, labels_rank) in tqdm(
+        metric_logger.log_every(data_loader, 10),
+        total=len(data_loader),
+        desc="Extracting features",
+    ):
         samples = samples.cuda(non_blocking=True)
         labels_rank = labels_rank.cuda(non_blocking=True)
         index = index.cuda(non_blocking=True)
-        features_rank = model(samples).float()
+
+        if mri_sequence_used_mask is not None:
+            # extend the mask to the batch size
+
+            batch_mri_sequence_used_mask = mri_sequence_used_mask.unsqueeze(0).expand(
+                samples.shape[0], -1
+            )
+            if mri_sequences == "random":
+                # randomly drop one MRI sequence
+                idx = torch.randint(
+                    0,
+                    batch_mri_sequence_used_mask.shape[-1],
+                    (batch_mri_sequence_used_mask.shape[0],),
+                )
+                batch_mri_sequence_used_mask = batch_mri_sequence_used_mask.clone()
+                batch_mri_sequence_used_mask[
+                    torch.arange(batch_mri_sequence_used_mask.shape[0]), idx
+                ] = 0
+
+            # extent to all tokens
+            num_tokens_per_sequence = int((samples.shape[-1] / model.patch_size) ** 2)
+
+            # mask in nc, n_tokens
+            # then flatten(1)
+            batch_mri_sequence_used_mask = (
+                batch_mri_sequence_used_mask.unsqueeze(2)
+                .expand(-1, -1, num_tokens_per_sequence)
+                .flatten(1)
+            )
+
+            # invert the mask, so that the model can ignore the MRI sequences not in mri_sequences
+            batch_mri_sequence_used_mask = ~batch_mri_sequence_used_mask
+        else:
+            batch_mri_sequence_used_mask = None
+
+        features_rank = model(samples, masks=batch_mri_sequence_used_mask).float()
 
         # init storage feature matrix
         if features is None:
-            features = torch.zeros(sample_count, features_rank.shape[-1], device=gather_device)
+            features = torch.zeros(
+                sample_count, *features_rank.shape[1:], device=gather_device
+            )
+
             labels_shape = list(labels_rank.shape)
             labels_shape[0] = sample_count
             all_labels = torch.full(labels_shape, fill_value=-1, device=gather_device)
-            logger.info(f"Storing features into tensor of shape {features.shape}")
+            logger.info(
+                f"Storing features into tensor with shape {features.shape} and labels with shape {all_labels.shape}"
+            )
 
         # share indexes, features and labels between processes
         index_all = all_gather_and_flatten(index).to(gather_device)
@@ -445,7 +560,7 @@ def extract_features_with_dataloader(model, data_loader, sample_count, gather_on
             features.index_copy_(0, index_all, features_all_ranks)
             all_labels.index_copy_(0, index_all, labels_all_ranks)
 
-    logger.info(f"Features shape: {tuple(features.shape)}")
+    logger.info(f"Features shapes: {tuple(features.shape)}")
     logger.info(f"Labels shape: {tuple(all_labels.shape)}")
 
     assert torch.all(all_labels > -1)
@@ -473,7 +588,9 @@ class MLkNN(MLClassifierBase):
 
     """
 
-    def __init__(self, k=10, s=1.0, ignore_first_neighbours=0, n_jobs=None, metric="cosine"):
+    def __init__(
+        self, k=10, s=1.0, ignore_first_neighbours=0, n_jobs=None, metric="cosine"
+    ):
         super(MLkNN, self).__init__()
         self.k = k  # Number of neighbours
         self.s = s  # Smooth parameter
@@ -592,50 +709,69 @@ class MLkNN(MLClassifierBase):
                 result[instance, label] = p_true / (p_true + p_false)
 
         return result
-    
+
+
 def apply_method_to_nested_values(d, method_name, nested_types=(dict)):
     result = {}
     for key, value in d.items():
         if isinstance(value, nested_types):
             result[key] = apply_method_to_nested_values(value, method_name)
+        elif isinstance(value, torch.Tensor) and value.numel() > 1:
+            # apply method to each value in tensor if more than one element
+            result[key] = [getattr(v, method_name)() for v in value]
         else:
-            method = getattr(value, method_name)
-            result[key] = method()
+            result[key] = getattr(value, method_name)()
     return result
 
-def make_datasets(train_dataset_str, test_dataset_str, val_dataset_str=None,
-                  train_transform=None, eval_transform=None, train_target_transform=None, eval_target_transform=None):
+
+def make_datasets(
+    train_dataset_str,
+    test_dataset_str,
+    val_dataset_str=None,
+    train_transform=None,
+    eval_transform=None,
+    train_target_transform=None,
+    eval_target_transform=None,
+):
     train_dataset = make_dataset(
         dataset_str=train_dataset_str,
         transform=train_transform,
-        target_transform=train_target_transform
+        target_transform=train_target_transform,
     )
-    if val_dataset_str == None:
+    if val_dataset_str is None:
         if train_dataset_str.replace("TRAIN", "VAL") != test_dataset_str:
-            val_dataset_ = make_dataset(
+            val_dataset = make_dataset(
                 dataset_str=train_dataset_str.replace("TRAIN", "VAL"),
                 transform=train_transform,
-                target_transform=train_target_transform
+                target_transform=train_target_transform,
             )
-            train_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset_])
         val_dataset = None
         logger.info("Train and val datasets have been combined.")
     else:
         val_dataset = make_dataset(
             dataset_str=val_dataset_str,
             transform=eval_transform,
-            target_transform=eval_target_transform
+            target_transform=eval_target_transform,
         )
     test_dataset = make_dataset(
         dataset_str=test_dataset_str,
         transform=eval_transform,
-        target_transform=eval_target_transform
+        target_transform=eval_target_transform,
     )
     return train_dataset, val_dataset, test_dataset
 
-def make_data_loaders(train_dataset, test_dataset, val_dataset=None,
-                    sampler_type=SamplerType.INFINITE, seed=0, start_iter=1,
-                    batch_size=16, num_workers=0, collate_fn=None):
+
+def make_data_loaders(
+    train_dataset,
+    test_dataset,
+    val_dataset=None,
+    sampler_type=SamplerType.INFINITE,
+    seed=0,
+    start_iter=1,
+    batch_size=16,
+    num_workers=0,
+    collate_fn=None,
+):
     train_data_loader = make_data_loader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -643,18 +779,18 @@ def make_data_loaders(train_dataset, test_dataset, val_dataset=None,
         shuffle=True,
         seed=seed,
         sampler_type=sampler_type,
-        sampler_advance=start_iter-1,
+        sampler_advance=start_iter - 1,
         drop_last=False,
         persistent_workers=False,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
     )
     val_data_loader = None
-    if val_dataset != None:
+    if val_dataset is not None:
         val_data_loader = make_data_loader(
             dataset=val_dataset,
             batch_size=batch_size,
             num_workers=num_workers,
-            sampler_type=None, 
+            sampler_type=None,
             drop_last=False,
             shuffle=False,
             persistent_workers=False,
@@ -663,8 +799,8 @@ def make_data_loaders(train_dataset, test_dataset, val_dataset=None,
     test_data_loader = make_data_loader(
         dataset=test_dataset,
         batch_size=batch_size,
-        num_workers=num_workers,
-        sampler_type=None, 
+        num_workers=0,  # other wise weird bug in dataloader...
+        sampler_type=None,
         drop_last=False,
         shuffle=False,
         persistent_workers=False,
@@ -673,13 +809,14 @@ def make_data_loaders(train_dataset, test_dataset, val_dataset=None,
 
     return train_data_loader, val_data_loader, test_data_loader
 
+
 def extract_hyperparameters_from_model(segmentor):
     hps = segmentor.split(":")[1:]
     hyperparameters = {}
     for hp in hps:
         key, value = hp.split("=")
         if key == "lr":
-            value = float(value.replace("_", ".")) 
+            value = float(value.replace("_", "."))
             hyperparameters[key] = [value]
         elif key == "avgpool":
             hyperparameters[key] = [ast.literal_eval(value.capitalize())]
@@ -688,6 +825,7 @@ def extract_hyperparameters_from_model(segmentor):
         else:
             hyperparameters[key] = [value]
     return hyperparameters
+
 
 def collate_fn_3d(batch):
     # batch is a list of tuples where each tuple is (video, label)
@@ -699,24 +837,29 @@ def collate_fn_3d(batch):
     max_len = max(video.size(0) for video in videos)
 
     # Create a tensor to hold the padded videos
-    padded_videos = torch.full((len(videos), max_len, channels, hw_size, hw_size), -100.0)
+    padded_videos = torch.full(
+        (len(videos), max_len, channels, hw_size, hw_size), -100.0
+    )
 
     # Pad each video
     for i, video in enumerate(videos):
-        padded_videos[i, :video.size(0)] = video
+        padded_videos[i, : video.size(0)] = video
 
     return padded_videos, labels
+
 
 def is_padded_matrix(matrix):
     return torch.allclose(matrix, torch.full_like(matrix, -100.0))
 
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+    if v.lower() in ("yes", "true", "t", "y", "1"):
         return True
     else:
         return False
+
 
 def trainable_parameters(model):
     trainable_params = 0
@@ -727,10 +870,11 @@ def trainable_parameters(model):
             trainable_params += param.numel()
     return trainable_params, all_param
 
+
 def bitfit(model):
     for name, p in model.named_parameters():
-        if 'bias' in name:
-            p.requires_grad=True
+        if "bias" in name:
+            p.requires_grad = True
         else:
-            p.requires_grad=False
+            p.requires_grad = False
     return model

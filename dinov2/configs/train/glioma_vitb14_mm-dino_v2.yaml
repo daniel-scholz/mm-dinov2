@@ -1,0 +1,49 @@
+train:
+  dataset_path: GliomaSSL:split=TRAIN:root=~/glioma_public_splits:mri_sequences=t2,t1,t1c,flair:random_axes=True:random_slices=True
+  batch_size_per_gpu: 64
+  num_workers: 15
+  OFFICIAL_EPOCH_LENGTH: 42 # 2661 train samples / batch size / 1 GPUs
+  saveckp_freq: 10
+  img_size: 518 # necessary to load pre-trained weights
+student:
+  arch: glioma_vit_base
+  use_mri_seq_embed: True
+  patch_size: 14
+  pretrained_weights: out/eval/training_24999/dinov2_vitb14_pretrain.pth
+teacher:
+  init_with_student_weights: True
+dino:
+  head_n_prototypes: 3 # n_classes
+ibot:
+  mask_per_channel: True
+  head_n_prototypes: 3
+crops:
+  global_crops_size: 98
+  local_crops_size: 56
+  global_crops_scale:
+    - 0.5
+    - 1.0
+  crop_from_tumor_foreground: True
+  local_crops_scale:
+    - 0.2
+    - 0.5
+  intensity_aug: null
+semi_supervised:
+  loss_weight: 0.5
+  label_smoothing: 0.1
+  temperature: 0.1
+optim:
+  base_lr: 1e-4
+  epochs: 200
+  freeze_backbone_epochs: 10
+  warmup_epochs: 20
+evaluation:
+  eval_period_iterations: 210 # OFFICIAL_EPOCH_LENGTH * 5
+  train_dataset_path: GliomaSupervised:split=TRAIN:root=~/glioma_public_splits:mri_sequences=t2,t1,t1c,flair
+  val_dataset_path: GliomaSupervised:split=VAL:root=~/glioma_public_splits:mri_sequences=t2,t1,t1c,flair
+  test_dataset_path: GliomaSupervised:split=TEST:root=~/glioma_public_splits:mri_sequences=t2,t1,t1c,flair
+  metric_types:
+    - mcc
+    - mean_per_class_accuracy
+    - multiclass_auc
+    - f1

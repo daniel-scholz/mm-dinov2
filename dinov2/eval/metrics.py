@@ -4,21 +4,28 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from enum import Enum
 import logging
+from enum import Enum
 from typing import Any, Dict, Optional
-from collections import OrderedDict
 
 import torch
 from torch import Tensor
 from torchmetrics import Metric, MetricCollection
-from torchmetrics.wrappers import ClasswiseWrapper
-from torchmetrics.classification import (MultilabelAUROC, MultilabelF1Score, MultilabelAccuracy, MulticlassF1Score, 
-                                        MulticlassAccuracy, MulticlassAUROC, Accuracy, BinaryF1Score, BinaryAUROC,
-                                        JaccardIndex, MulticlassJaccardIndex, Dice, BinaryAUROC)
+from torchmetrics.classification import (
+    BinaryAUROC,
+    F1Score,
+    MatthewsCorrCoef,
+    MulticlassAccuracy,
+    MulticlassAUROC,
+    MultilabelAccuracy,
+    MultilabelAUROC,
+    MultilabelF1Score,
+)
 from torchmetrics.utilities.data import dim_zero_cat, select_topk
+from torchmetrics.wrappers import ClasswiseWrapper
 
 logger = logging.getLogger("dinov2")
+
 
 class MetricType(Enum):
     MEAN_ACCURACY = "mean_accuracy"
@@ -29,6 +36,8 @@ class MetricType(Enum):
     BINARY_AUROC = "binary_auc"
     PER_CLASS_ACCURACY = "per_class_accuracy"
     IMAGENET_REAL_ACCURACY = "imagenet_real_accuracy"
+    MATTHEWS_CORRELATION_COEFFICIENT = "mcc"
+    F1_SCORE = "f1"
 
     SEGMENTATION_METRICS = "segmentation_metrics"
 
@@ -49,6 +58,7 @@ class MetricAveraging(Enum):
     BINARY_AUROC = "macro"
     MULTCLASS_JACCARD = "macro"
     PER_CLASS_ACCURACY = "none"
+    MATTHEWS_CORRELATION_COEFFICIENT = "none"
 
     SEGMENTATION_METRICS = "macro"
 
@@ -56,39 +66,52 @@ class MetricAveraging(Enum):
         return self.value
 
 
-def build_metric(metric_type: MetricType, *, num_classes: int, labels = None, ks: Optional[tuple] = None):
+def build_metric(
+    metric_type: MetricType,
+    *,
+    num_classes: int,
+    labels=None,
+    ks: Optional[tuple] = None,
+):
     if metric_type == MetricType.MULTILABEL_ACCURACY:
         return build_multilabel_accuracy_metric(
             average_type=metric_type.accuracy_averaging,
             num_labels=num_classes,
-            labels=labels
+            labels=labels,
         )
     elif metric_type == MetricType.MULTILABEL_AUROC:
         return build_multilabel_auroc_metric(
             average_type=metric_type.accuracy_averaging,
             num_labels=num_classes,
-            labels=labels
+            labels=labels,
         )
     elif metric_type == MetricType.MULTICLASS_AUROC:
         return build_multiclass_auroc_metric(
             average_type=metric_type.accuracy_averaging,
             num_classes=num_classes,
-            labels=labels
+            labels=labels,
         )
-    elif metric_type == MetricType.SEGMENTATION_METRICS:
-        return build_segmentation_metrics(
-            average_type=metric_type.accuracy_averaging,
-            num_labels=num_classes,
-            labels=labels
-        )
+
     elif metric_type == MetricType.BINARY_AUROC:
         return build_binary_auroc_metric()
-
+    elif metric_type == MetricType.MATTHEWS_CORRELATION_COEFFICIENT:
+        return build_mcc(
+            average_type=metric_type.accuracy_averaging, num_classes=num_classes
+        )
+    elif metric_type == MetricType.F1_SCORE:
+        metrics: Dict[str, Metric] = {
+            "f1": F1Score(
+                num_classes=num_classes,
+                average=None,
+                task="multiclass" if num_classes > 2 else "binary",
+            )
+        }
+        return MetricCollection(metrics)
     if metric_type.accuracy_averaging is not None:
         return build_topk_accuracy_metric(
             average_type=metric_type.accuracy_averaging,
             num_classes=num_classes,
-            ks=(1, 5) if ks is None else ks,
+            ks=(1, min(5, num_classes - 1)) if ks is None else ks,
         )
     elif metric_type == MetricType.IMAGENET_REAL_ACCURACY:
         return build_topk_imagenet_real_accuracy_metric(
@@ -99,68 +122,119 @@ def build_metric(metric_type: MetricType, *, num_classes: int, labels = None, ks
     raise ValueError(f"Unknown metric type {metric_type}")
 
 
-def build_segmentation_metrics(average_type: MetricAveraging, num_labels: int=2, labels=None):
+def build_mcc(average_type: MetricAveraging, num_classes: int):
     metrics: Dict[str, Metric] = {
-        "jaccard": MulticlassJaccardIndex(num_classes=num_labels, average=average_type.value, ignore_index=0),
-        "dice": Dice(num_classes=num_labels, average=average_type.value, ignore_index=0),
+        "mcc": MatthewsCorrCoef(
+            task="multiclass" if num_classes > 2 else "binary",
+            num_classes=num_classes,
+        )
     }
     return MetricCollection(metrics)
+
 
 def build_multilabel_accuracy_metric(average_type: MetricAveraging, num_labels: int):
     metrics: Dict[str, Metric] = {
-         f"accuracy": MultilabelAccuracy(num_labels=num_labels, average=average_type.value)
+        "accuracy": MultilabelAccuracy(
+            num_labels=num_labels, average=average_type.value
+        )
     }
     return MetricCollection(metrics)
 
-def build_multilabel_auroc_metric(average_type: MetricAveraging, num_labels: int, labels=None):
+
+def build_multilabel_auroc_metric(
+    average_type: MetricAveraging, num_labels: int, labels=None
+):
     metrics: Dict[str, Metric] = {
         "auroc": MultilabelAUROC(num_labels=num_labels, average=average_type.value),
-        "class-specific": MetricCollection({
-            "auroc": ClasswiseWrapper(MultilabelAUROC(num_labels=num_labels, average=None), labels=labels, prefix="_"),
-        })
+        "class-specific": MetricCollection(
+            {
+                "auroc": ClasswiseWrapper(
+                    MultilabelAUROC(num_labels=num_labels, average=None),
+                    labels=labels,
+                    prefix="_",
+                ),
+            }
+        ),
     }
     return MetricCollection(metrics)
 
-def build_multiclass_auroc_metric(average_type: MetricAveraging, num_classes: int, labels=None):
+
+def build_multiclass_auroc_metric(
+    average_type: MetricAveraging, num_classes: int, labels=None
+):
     metrics: Dict[str, Metric] = {
-        "auroc": MulticlassAUROC(num_classes=num_classes, average=average_type.value),
-        "class-specific": MetricCollection({
-            "auroc": ClasswiseWrapper(MulticlassAUROC(num_classes=num_classes, average=None), labels=labels, prefix="_"),
-        })
+        "auroc": MulticlassAUROC(
+            num_classes=int(num_classes), average=average_type.value
+        ),
+        "class-specific": MetricCollection(
+            {
+                "auroc": ClasswiseWrapper(
+                    MulticlassAUROC(num_classes=num_classes, average=None),
+                    labels=labels,
+                    prefix="_",
+                ),
+            }
+        ),
     }
     return MetricCollection(metrics)
+
 
 def build_binary_auroc_metric():
-    metrics: Dict[str, Metric] = {
-        "auroc": BinaryAUROC()
-        }
+    metrics: Dict[str, Metric] = {"auroc": BinaryAUROC()}
     return MetricCollection(metrics)
 
-def build_multilabel_metrics(average_type: MetricAveraging, num_labels: int, labels=None):
+
+def build_multilabel_metrics(
+    average_type: MetricAveraging, num_labels: int, labels=None
+):
     metrics: Dict[str, Metric] = {
         "auroc": MultilabelAUROC(num_labels=num_labels, average=average_type.value),
-        "accuracy": MultilabelAccuracy(num_labels=num_labels, average=average_type.value),
+        "accuracy": MultilabelAccuracy(
+            num_labels=num_labels, average=average_type.value
+        ),
         "f1": MultilabelF1Score(num_labels=num_labels, average=average_type.value),
-        "class-specific": MetricCollection({
-            "auroc": ClasswiseWrapper(MultilabelAUROC(num_labels=num_labels, average=None), labels=labels, prefix="_"),
-            "accuracy":ClasswiseWrapper(MultilabelAccuracy(num_labels=num_labels, average=None), labels=labels, prefix="_"),
-            "f1": ClasswiseWrapper(MultilabelF1Score(num_labels=num_labels, average=None), labels=labels, prefix="_")
-        })
+        "class-specific": MetricCollection(
+            {
+                "auroc": ClasswiseWrapper(
+                    MultilabelAUROC(num_labels=num_labels, average=None),
+                    labels=labels,
+                    prefix="_",
+                ),
+                "accuracy": ClasswiseWrapper(
+                    MultilabelAccuracy(num_labels=num_labels, average=None),
+                    labels=labels,
+                    prefix="_",
+                ),
+                "f1": ClasswiseWrapper(
+                    MultilabelF1Score(num_labels=num_labels, average=None),
+                    labels=labels,
+                    prefix="_",
+                ),
+            }
+        ),
     }
     return MetricCollection(metrics)
-    
 
-def build_topk_accuracy_metric(average_type: MetricAveraging, num_classes: int, ks: tuple = (1, 5)):
+
+def build_topk_accuracy_metric(
+    average_type: MetricAveraging, num_classes: int, ks: tuple = (1, 5)
+):
     metrics: Dict[str, Metric] = {
-        f"top-{k}": MulticlassAccuracy(top_k=k, num_classes=int(num_classes), average=average_type.value) for k in ks
+        f"top-{k}": MulticlassAccuracy(
+            top_k=k, num_classes=int(num_classes), average=average_type.value
+        )
+        for k in ks
     }
     return MetricCollection(metrics)
 
 
 def build_topk_imagenet_real_accuracy_metric(num_classes: int, ks: tuple = (1, 5)):
-    metrics: Dict[str, Metric] = {f"top-{k}": ImageNetReaLAccuracy(top_k=k, num_classes=int(num_classes)) for k in ks}
+    metrics: Dict[str, Metric] = {
+        f"top-{k}": ImageNetReaLAccuracy(top_k=k, num_classes=int(num_classes))
+        for k in ks
+    }
     return MetricCollection(metrics)
-    
+
 
 class ImageNetReaLAccuracy(Metric):
     is_differentiable: bool = False
@@ -185,7 +259,11 @@ class ImageNetReaLAccuracy(Metric):
         # select top K highest probabilities, use one hot representation
         preds_oh = select_topk(preds, self.top_k)
         # target_oh [B, D + 1] with 0 and 1
-        target_oh = torch.zeros((preds_oh.shape[0], preds_oh.shape[1] + 1), device=target.device, dtype=torch.int32)
+        target_oh = torch.zeros(
+            (preds_oh.shape[0], preds_oh.shape[1] + 1),
+            device=target.device,
+            dtype=torch.int32,
+        )
         target = target.long()
         # for undefined targets (-1) use a fake value `num_classes`
         target[target == -1] = self.num_classes

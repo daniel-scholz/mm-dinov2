@@ -10,8 +10,8 @@
 
 from typing import Callable, Optional, Tuple, Union
 
-from torch import Tensor
 import torch.nn as nn
+from torch import Tensor
 
 
 def make_2tuple(x):
@@ -63,27 +63,57 @@ class PatchEmbed(nn.Module):
 
         self.flatten_embedding = flatten_embedding
 
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_HW, stride=patch_HW)
+        self.proj = nn.Conv2d(
+            in_chans, embed_dim, kernel_size=patch_HW, stride=patch_HW
+        )
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:
         _, _, H, W = x.shape
         patch_H, patch_W = self.patch_size
 
-        assert H % patch_H == 0, f"Input image height {H} is not a multiple of patch height {patch_H}"
-        assert W % patch_W == 0, f"Input image width {W} is not a multiple of patch width: {patch_W}"
+        assert H % patch_H == 0, (
+            f"Input image height {H} is not a multiple of patch height {patch_H}"
+        )
+        assert W % patch_W == 0, (
+            f"Input image width {W} is not a multiple of patch width: {patch_W}"
+        )
+
+        # x_chunks = x
+        # x_chunks = x.split(3, dim=1)
+        # n_seqs = len(x_chunks)  # S
+        # x_chunks = torch.cat(x_chunks)  # B*S C H W
+
+        # x_chunks = x
+        # x_chunks = x.split(3, dim=1)
+        # n_seqs = len(x_chunks)  # S
+        # x_chunks = torch.cat(x_chunks)  # B*S C H W
 
         x = self.proj(x)  # B C H W
+        # x_chunks = self.proj(x_chunks)  # B*S C H W
+        # x = x_chunks
         H, W = x.size(2), x.size(3)
-        x = x.flatten(2).transpose(1, 2)  # B HW C
+        x = x.flatten(2).transpose(1, 2)  # B H*W C
         x = self.norm(x)
+
+        # TODO: implement this, for now: sequences are collected in batch dimension
+        # treat sequences as tokens of the same image
+        # x = x.reshape(-1, n_seqs, H * W, self.embed_dim)  # B S E H W
+        # x = x.flatten(1, 2)  # B S*E H W
+
         if not self.flatten_embedding:
             x = x.reshape(-1, H, W, self.embed_dim)  # B H W C
         return x
 
     def flops(self) -> float:
         Ho, Wo = self.patches_resolution
-        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
+        flops = (
+            Ho
+            * Wo
+            * self.embed_dim
+            * self.in_chans
+            * (self.patch_size[0] * self.patch_size[1])
+        )
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops

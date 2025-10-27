@@ -117,7 +117,9 @@ class InfiniteSampler(Sampler):
         generator = torch.Generator().manual_seed(self._seed)
 
         while True:
-            iterable = _generate_randperm_indices(size=self._sample_count, generator=generator)
+            iterable = _generate_randperm_indices(
+                size=self._sample_count, generator=generator
+            )
             yield from itertools.islice(iterable, self._start, None, self._step)
 
 
@@ -136,7 +138,11 @@ def _shuffle_tensor_slice(
     result = np.empty(count, dtype=dtype)
 
     for i in range(count):
-        j = torch.randint(0, i + 1, size=(1,), generator=generator).item() if i > 0 else 0
+        j = (
+            torch.randint(0, i + 1, size=(1,), generator=generator).item()
+            if i > 0
+            else 0
+        )
 
         result[i] = result[j]
         result[j] = tensor[start + i * step].item()
@@ -183,7 +189,9 @@ class ShardedInfiniteSampler(Sampler):
         self._advance = advance
         self._iter_count = 0
         self._shuffle_tensor_slice_fn = (
-            _new_shuffle_tensor_slice if use_new_shuffle_tensor_slice else _shuffle_tensor_slice
+            _new_shuffle_tensor_slice
+            if use_new_shuffle_tensor_slice
+            else _shuffle_tensor_slice
         )
 
     def __iter__(self):

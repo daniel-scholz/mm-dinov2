@@ -4,20 +4,24 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
 import logging
+from functools import partial
 
 import torch
 from torch import nn
 
-from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
-from dinov2.models import build_model_from_cfg
+from dinov2.fsdp import (
+    ShardedGradScaler,
+    get_fsdp_modules,
+    get_fsdp_wrapper,
+    reshard_fsdp_model,
+)
 from dinov2.layers import DINOHead
-from dinov2.utils.utils import has_batchnorms
-from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
-from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
-
+from dinov2.loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
+from dinov2.models import build_model_from_cfg
 from dinov2.models.vision_transformer import BlockChunk
+from dinov2.utils.param_groups import fuse_params_groups, get_params_groups_with_decay
+from dinov2.utils.utils import has_batchnorms, load_pretrained_weights
 
 try:
     from xformers.ops import fmha
@@ -35,7 +39,9 @@ class SSLMetaArch(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
+        self.fp16_scaler = (
+            ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
+        )
 
         student_model_dict = dict()
         teacher_model_dict = dict()
@@ -47,8 +53,17 @@ class SSLMetaArch(nn.Module):
 
         if cfg.student.pretrained_weights:
             chkpt = torch.load(cfg.student.pretrained_weights)
-            logger.info(f"OPTIONS -- pretrained weights: loading from {cfg.student.pretrained_weights}")
-            student_backbone.load_state_dict(chkpt["model"], strict=False)
+            logger.info(
+                f"OPTIONS -- pretrained weights: loading from {cfg.student.pretrained_weights}"
+            )
+            ckpt_key = next(iter(chkpt)) if len(chkpt) == 1 else None
+            load_pretrained_weights(
+                student_backbone, cfg.student.pretrained_weights, ckpt_key
+            )
+
+        if cfg.teacher.init_with_student_weights:
+            logger.info("OPTIONS -- teacher initialized with student weights")
+            teacher_backbone.load_state_dict(student_backbone.state_dict())
 
         self.embed_dim = embed_dim
         self.dino_out_dim = cfg.dino.head_n_prototypes
@@ -56,14 +71,22 @@ class SSLMetaArch(nn.Module):
         self.do_dino = cfg.dino.loss_weight > 0
         self.do_koleo = cfg.dino.koleo_loss_weight > 0
         self.do_ibot = cfg.ibot.loss_weight > 0
+        self.do_semi_supervised = cfg.semi_supervised.loss_weight > 0
+        # could be set to true at scale
         self.ibot_separate_head = cfg.ibot.separate_head
 
         logger.info("OPTIONS -- DINO")
         if self.do_dino:
             logger.info(f"OPTIONS -- DINO -- loss_weight: {cfg.dino.loss_weight}")
-            logger.info(f"OPTIONS -- DINO -- head_n_prototypes: {cfg.dino.head_n_prototypes}")
-            logger.info(f"OPTIONS -- DINO -- head_bottleneck_dim: {cfg.dino.head_bottleneck_dim}")
-            logger.info(f"OPTIONS -- DINO -- head_hidden_dim: {cfg.dino.head_hidden_dim}")
+            logger.info(
+                f"OPTIONS -- DINO -- head_n_prototypes: {cfg.dino.head_n_prototypes}"
+            )
+            logger.info(
+                f"OPTIONS -- DINO -- head_bottleneck_dim: {cfg.dino.head_bottleneck_dim}"
+            )
+            logger.info(
+                f"OPTIONS -- DINO -- head_hidden_dim: {cfg.dino.head_hidden_dim}"
+            )
             self.dino_loss_weight = cfg.dino.loss_weight
             dino_head = partial(
                 DINOHead,
@@ -85,21 +108,44 @@ class SSLMetaArch(nn.Module):
             student_model_dict["dino_head"] = dino_head()
             teacher_model_dict["dino_head"] = dino_head()
 
+            if cfg.teacher.init_with_student_weights:
+                teacher_model_dict["dino_head"].load_state_dict(
+                    student_model_dict["dino_head"].state_dict()
+                )
+
         logger.info("OPTIONS -- IBOT")
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
+        logger.info(
+            f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}"
+        )
+        logger.info(
+            f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}"
+        )
         if self.do_ibot:
             self.ibot_loss_weight = cfg.ibot.loss_weight
-            assert max(cfg.ibot.mask_ratio_min_max) > 0, "please provide a positive mask ratio tuple for ibot"
-            assert cfg.ibot.mask_sample_probability > 0, "please provide a positive mask probability for ibot"
-            self.ibot_out_dim = cfg.ibot.head_n_prototypes if self.ibot_separate_head else cfg.dino.head_n_prototypes
+            assert max(cfg.ibot.mask_ratio_min_max) > 0, (
+                "please provide a positive mask ratio tuple for ibot"
+            )
+            assert cfg.ibot.mask_sample_probability > 0, (
+                "please provide a positive mask probability for ibot"
+            )
+            self.ibot_out_dim = (
+                cfg.ibot.head_n_prototypes
+                if self.ibot_separate_head
+                else cfg.dino.head_n_prototypes
+            )
             self.ibot_patch_loss = iBOTPatchLoss(self.ibot_out_dim)
             if self.ibot_separate_head:
                 logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-                logger.info(f"OPTIONS -- IBOT -- head_n_prototypes: {cfg.ibot.head_n_prototypes}")
-                logger.info(f"OPTIONS -- IBOT -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}")
-                logger.info(f"OPTIONS -- IBOT -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
+                logger.info(
+                    f"OPTIONS -- IBOT -- head_n_prototypes: {cfg.ibot.head_n_prototypes}"
+                )
+                logger.info(
+                    f"OPTIONS -- IBOT -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}"
+                )
+                logger.info(
+                    f"OPTIONS -- IBOT -- head_hidden_dim: {cfg.ibot.head_hidden_dim}"
+                )
                 ibot_head = partial(
                     DINOHead,
                     in_dim=embed_dim,
@@ -110,8 +156,17 @@ class SSLMetaArch(nn.Module):
                 )
                 student_model_dict["ibot_head"] = ibot_head()
                 teacher_model_dict["ibot_head"] = ibot_head()
+                if cfg.teacher.init_with_student_weights:
+                    teacher_model_dict["ibot_head"].load_state_dict(
+                        student_model_dict["ibot_head"].state_dict()
+                    )
             else:
                 logger.info("OPTIONS -- IBOT -- head shared with DINO")
+
+        if self.do_semi_supervised:
+            self.semi_supervised_loss_weight = cfg.semi_supervised.loss_weight
+            self.semi_supervised_label_smoothing = cfg.semi_supervised.label_smoothing
+            self.semi_supervised_temperature = cfg.semi_supervised.temperature
 
         self.need_to_synchronize_fsdp_streams = True
 
@@ -121,7 +176,9 @@ class SSLMetaArch(nn.Module):
         # there is no backpropagation through the teacher, so no need for gradients
         for p in self.teacher.parameters():
             p.requires_grad = False
-        logger.info(f"Student and Teacher are built: they are both {cfg.student.arch} network.")
+        logger.info(
+            f"Student and Teacher are built: they are both {cfg.student.arch} network."
+        )
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -134,7 +191,7 @@ class SSLMetaArch(nn.Module):
 
     def forward_backward(self, images, teacher_temp):
         n_global_crops = 2
-        assert n_global_crops == 2
+        # assert n_global_crops == 2
         n_local_crops = self.cfg.crops.local_crops_number
 
         global_crops = images["collated_global_crops"].cuda(non_blocking=True)
@@ -152,6 +209,7 @@ class SSLMetaArch(nn.Module):
 
         do_dino = self.do_dino
         do_ibot = self.do_ibot
+        do_semi_supervised = self.do_semi_supervised
 
         # loss scales
         ibot_loss_scale = 1.0 / n_global_crops
@@ -160,83 +218,135 @@ class SSLMetaArch(nn.Module):
         @torch.no_grad()
         def get_teacher_output():
             x, n_global_crops_teacher = global_crops, n_global_crops
-            teacher_backbone_output_dict = self.teacher.backbone(x, is_training=True)
+
+            teacher_backbone_output_dict = self.teacher.backbone(x, ret_feat_dict=True)
             teacher_cls_tokens = teacher_backbone_output_dict["x_norm_clstoken"]
             teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
             # watch out: these are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
-            teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]))
-            ibot_teacher_patch_tokens = teacher_backbone_output_dict["x_norm_patchtokens"]
+            teacher_cls_tokens = torch.cat(
+                (teacher_cls_tokens[1], teacher_cls_tokens[0])
+            )
+            ibot_teacher_patch_tokens = teacher_backbone_output_dict[
+                "x_norm_patchtokens"
+            ]
             _dim = ibot_teacher_patch_tokens.shape[-1]
             n_cls_tokens = teacher_cls_tokens.shape[0]
 
             if do_ibot and not self.ibot_separate_head:
-                buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(upperbound + n_cls_tokens, _dim)
+                # create buffer for teacher cls tokens and masked patches tokens
+                buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(
+                    upperbound + n_cls_tokens, _dim
+                )
                 buffer_tensor_teacher[:n_cls_tokens].copy_(teacher_cls_tokens)
+                # we only need the masked patches
                 torch.index_select(
                     ibot_teacher_patch_tokens.flatten(0, 1),
                     dim=0,
                     index=mask_indices_list,
-                    out=buffer_tensor_teacher[n_cls_tokens : n_cls_tokens + n_masked_patches],
+                    out=buffer_tensor_teacher[
+                        n_cls_tokens : n_cls_tokens + n_masked_patches
+                    ],
                 )
+                # run teacher dino head for cls tokens and masked patches
                 tokens_after_head = self.teacher.dino_head(buffer_tensor_teacher)
+                # separate cls tokens
                 teacher_cls_tokens_after_head = tokens_after_head[:n_cls_tokens]
+                # and masked patches, which are used for ibot
                 masked_teacher_patch_tokens_after_head = tokens_after_head[
                     n_cls_tokens : n_cls_tokens + n_masked_patches
                 ]
             elif do_ibot and self.ibot_separate_head:
-                buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(upperbound, _dim)
+                buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(
+                    upperbound, _dim
+                )
                 torch.index_select(
                     ibot_teacher_patch_tokens.flatten(0, 1),
                     dim=0,
                     index=mask_indices_list,
                     out=buffer_tensor_teacher[:n_masked_patches],
                 )
-                teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
-                masked_teacher_patch_tokens_after_head = self.teacher.ibot_head(buffer_tensor_teacher)[
-                    :n_masked_patches
-                ]
+                teacher_cls_tokens_after_head = self.teacher.dino_head(
+                    teacher_cls_tokens
+                )
+                masked_teacher_patch_tokens_after_head = self.teacher.ibot_head(
+                    buffer_tensor_teacher
+                )[:n_masked_patches]
             else:
-                teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
+                teacher_cls_tokens_after_head = self.teacher.dino_head(
+                    teacher_cls_tokens
+                )
                 masked_teacher_ibot_softmaxed_centered = None
 
             if self.cfg.train.centering == "centering":
-                teacher_dino_softmaxed_centered_list = self.dino_loss.softmax_center_teacher(
-                    teacher_cls_tokens_after_head, teacher_temp=teacher_temp
-                ).view(n_global_crops_teacher, -1, *teacher_cls_tokens_after_head.shape[1:])
+                teacher_dino_softmaxed_centered_list = (
+                    self.dino_loss.softmax_center_teacher(
+                        teacher_cls_tokens_after_head, teacher_temp=teacher_temp
+                    ).view(
+                        n_global_crops_teacher,
+                        -1,
+                        *teacher_cls_tokens_after_head.shape[1:],
+                    )
+                )
                 self.dino_loss.update_center(teacher_cls_tokens_after_head)
                 if do_ibot:
-                    masked_teacher_patch_tokens_after_head = masked_teacher_patch_tokens_after_head.unsqueeze(0)
-                    masked_teacher_ibot_softmaxed_centered = self.ibot_patch_loss.softmax_center_teacher(
-                        masked_teacher_patch_tokens_after_head[:, :n_masked_patches], teacher_temp=teacher_temp
+                    masked_teacher_patch_tokens_after_head = (
+                        masked_teacher_patch_tokens_after_head.unsqueeze(0)
                     )
-                    masked_teacher_ibot_softmaxed_centered = masked_teacher_ibot_softmaxed_centered.squeeze(0)
-                    self.ibot_patch_loss.update_center(masked_teacher_patch_tokens_after_head[:n_masked_patches])
+                    masked_teacher_ibot_softmaxed_centered = (
+                        self.ibot_patch_loss.softmax_center_teacher(
+                            masked_teacher_patch_tokens_after_head[
+                                :, :n_masked_patches
+                            ],
+                            teacher_temp=teacher_temp,
+                        )
+                    )
+                    masked_teacher_ibot_softmaxed_centered = (
+                        masked_teacher_ibot_softmaxed_centered.squeeze(0)
+                    )
+                    self.ibot_patch_loss.update_center(
+                        masked_teacher_patch_tokens_after_head[:n_masked_patches]
+                    )
 
             elif self.cfg.train.centering == "sinkhorn_knopp":
-                teacher_dino_softmaxed_centered_list = self.dino_loss.sinkhorn_knopp_teacher(
-                    teacher_cls_tokens_after_head, teacher_temp=teacher_temp
-                ).view(n_global_crops_teacher, -1, *teacher_cls_tokens_after_head.shape[1:])
+                teacher_dino_softmaxed_centered_list = (
+                    self.dino_loss.sinkhorn_knopp_teacher(
+                        teacher_cls_tokens_after_head, teacher_temp=teacher_temp
+                    ).view(
+                        n_global_crops_teacher,
+                        -1,
+                        *teacher_cls_tokens_after_head.shape[1:],
+                    )
+                )
 
                 if do_ibot:
-                    masked_teacher_ibot_softmaxed_centered = self.ibot_patch_loss.sinkhorn_knopp_teacher(
-                        masked_teacher_patch_tokens_after_head,
-                        teacher_temp=teacher_temp,
-                        n_masked_patches_tensor=n_masked_patches_tensor,
+                    masked_teacher_ibot_softmaxed_centered = (
+                        self.ibot_patch_loss.sinkhorn_knopp_teacher(
+                            masked_teacher_patch_tokens_after_head,
+                            teacher_temp=teacher_temp,
+                            n_masked_patches_tensor=n_masked_patches_tensor,
+                        )
                     )
 
             else:
                 raise NotImplementedError
 
-            return teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered
+            return (
+                teacher_dino_softmaxed_centered_list,
+                masked_teacher_ibot_softmaxed_centered,
+            )
 
-        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered = get_teacher_output()
+        teacher_dino_softmaxed_centered_list, masked_teacher_ibot_softmaxed_centered = (
+            get_teacher_output()
+        )
         reshard_fsdp_model(self.teacher)
 
         loss_dict = {}
 
         loss_accumulator = 0  # for backprop
-        student_global_backbone_output_dict, student_local_backbone_output_dict = self.student.backbone(
-            [global_crops, local_crops], masks=[masks, None], is_training=True
+        student_global_backbone_output_dict, student_local_backbone_output_dict = (
+            self.student.backbone(
+                [global_crops, local_crops], masks=[masks, None], ret_feat_dict=True
+            )
         )
 
         inputs_for_student_head_list = []
@@ -246,26 +356,40 @@ class SSLMetaArch(nn.Module):
         inputs_for_student_head_list.append(student_local_cls_tokens.unsqueeze(0))
 
         # 1b: global crops cls tokens
-        student_global_cls_tokens = student_global_backbone_output_dict["x_norm_clstoken"]
+        student_global_cls_tokens = student_global_backbone_output_dict[
+            "x_norm_clstoken"
+        ]
         inputs_for_student_head_list.append(student_global_cls_tokens.unsqueeze(0))
 
         # 1c: global crops patch tokens
         if do_ibot:
             _dim = student_global_backbone_output_dict["x_norm_clstoken"].shape[-1]
-            ibot_student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"]
-            buffer_tensor_patch_tokens = ibot_student_patch_tokens.new_zeros(upperbound, _dim)
+            ibot_student_patch_tokens = student_global_backbone_output_dict[
+                "x_norm_patchtokens"
+            ]
+            buffer_tensor_patch_tokens = ibot_student_patch_tokens.new_zeros(
+                upperbound, _dim
+            )
             buffer_tensor_patch_tokens[:n_masked_patches].copy_(
-                torch.index_select(ibot_student_patch_tokens.flatten(0, 1), dim=0, index=mask_indices_list)
+                torch.index_select(
+                    ibot_student_patch_tokens.flatten(0, 1),
+                    dim=0,
+                    index=mask_indices_list,
+                )
             )
             if not self.ibot_separate_head:
-                inputs_for_student_head_list.append(buffer_tensor_patch_tokens.unsqueeze(0))
+                inputs_for_student_head_list.append(
+                    buffer_tensor_patch_tokens.unsqueeze(0)
+                )
             else:
-                student_global_masked_patch_tokens_after_head = self.student.ibot_head(buffer_tensor_patch_tokens)[
-                    :n_masked_patches
-                ]
+                student_global_masked_patch_tokens_after_head = self.student.ibot_head(
+                    buffer_tensor_patch_tokens
+                )[:n_masked_patches]
 
         # 2: run
-        _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
+        _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(
+            inputs_for_student_head_list
+        )
         outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
 
         # 3a: local crops cls tokens
@@ -276,11 +400,15 @@ class SSLMetaArch(nn.Module):
 
         # 3c: global crops patch tokens
         if do_ibot and not self.ibot_separate_head:
-            student_global_masked_patch_tokens_after_head = outputs_list.pop(0).squeeze(0)[:n_masked_patches]
+            student_global_masked_patch_tokens_after_head = outputs_list.pop(0).squeeze(
+                0
+            )[:n_masked_patches]
 
         if n_local_crops > 0:
             dino_local_crops_loss = self.dino_loss(
-                student_output_list=student_local_cls_tokens_after_head.chunk(n_local_crops),
+                student_output_list=student_local_cls_tokens_after_head.chunk(
+                    n_local_crops
+                ),
                 teacher_out_softmaxed_centered_list=teacher_dino_softmaxed_centered_list,
             ) / (n_global_crops_loss_terms + n_local_crops_loss_terms)
 
@@ -342,6 +470,77 @@ class SSLMetaArch(nn.Module):
             # accumulate loss
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
+        # ============ supervised loss ... ============
+
+        if do_semi_supervised:
+            cls_labels = images["collate_cls_labels"].cuda(non_blocking=True)
+
+            labeled_mask = cls_labels != -1
+
+            local_cls_chunked = student_local_cls_tokens_after_head.chunk(n_local_crops)
+
+            global_cls_chunked = student_global_cls_tokens_after_head.chunk(
+                n_global_crops
+            )
+
+            labeled_labels = cls_labels[labeled_mask]
+            if labeled_labels.numel() != 0:
+                # dummy encode label labels as three-dim one-hot
+                labeled_labels = nn.functional.one_hot(
+                    labeled_labels, num_classes=3
+                ).float()
+
+                lab_loss_accum = 0
+                accuracies = torch.zeros(
+                    len(local_cls_chunked) + len(global_cls_chunked),
+                    device=labeled_labels.device,
+                )
+                for i, cls_tokens in enumerate(local_cls_chunked + global_cls_chunked):
+                    cls_tokens_labeled = cls_tokens[labeled_mask]
+
+                    weight = (
+                        labeled_labels.shape[0] / (labeled_labels.sum(0) + 1e-6)
+                    ).log()
+                    weight[torch.isnan(weight)] = 0
+
+                    lab_loss_accum += nn.functional.cross_entropy(
+                        cls_tokens_labeled / self.semi_supervised_temperature,
+                        labeled_labels,
+                        # add inverse frequency weighting
+                        weight=weight,
+                        label_smoothing=self.semi_supervised_label_smoothing,
+                    )
+                    accuracies[i] = (
+                        (
+                            cls_tokens_labeled.argmax(dim=-1)
+                            == labeled_labels.argmax(dim=-1)
+                        )
+                        .float()
+                        .mean()
+                    )
+
+                lab_loss_accum /= len(local_cls_chunked) + len(global_cls_chunked)
+
+                labeled_loss_weight = labeled_mask.float().mean()
+
+                loss_dict["labeled_loss"] = lab_loss_accum
+                loss_dict["labeled_ratio"] = labeled_loss_weight
+                # evaluate accuracy of predictions
+                loss_dict["labeled_acc_local"] = accuracies[
+                    : len(local_cls_chunked)
+                ].mean()
+                loss_dict["labeled_acc_global"] = accuracies[
+                    len(local_cls_chunked) :
+                ].mean()
+
+                loss_accumulator += (
+                    lab_loss_accum
+                    * labeled_loss_weight
+                    * self.semi_supervised_loss_weight
+                )
+            else:
+                loss_dict["labeled_ratio"] = torch.tensor(0.0, device=cls_labels.device)
+
         self.backprop_loss(loss_accumulator)
 
         self.fsdp_synchronize_streams()
@@ -351,9 +550,9 @@ class SSLMetaArch(nn.Module):
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-            self.student.dino_head._streams = (
-                self.teacher.dino_head._streams
-            ) = self.student.backbone._streams = self.teacher.backbone._streams
+            self.student.dino_head._streams = self.teacher.dino_head._streams = (
+                self.student.backbone._streams
+            ) = self.teacher.backbone._streams
             self.need_to_synchronize_fsdp_streams = False
 
     def update_teacher(self, m):
@@ -361,7 +560,9 @@ class SSLMetaArch(nn.Module):
         teacher_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
-                for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
+                for ms, mt in zip(
+                    get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])
+                ):
                     student_param_list += ms.params
                     teacher_param_list += mt.params
             torch._foreach_mul_(teacher_param_list, m)
@@ -398,6 +599,10 @@ class SSLMetaArch(nn.Module):
         for k, v in self.student.items():
             self.teacher[k].load_state_dict(self.student[k].state_dict())
             student_model_cfg = self.cfg.compute_precision.student[k]
-            self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
+            self.student[k] = get_fsdp_wrapper(
+                student_model_cfg, modules_to_wrap={BlockChunk}
+            )(self.student[k])
             teacher_model_cfg = self.cfg.compute_precision.teacher[k]
-            self.teacher[k] = get_fsdp_wrapper(teacher_model_cfg, modules_to_wrap={BlockChunk})(self.teacher[k])
+            self.teacher[k] = get_fsdp_wrapper(
+                teacher_model_cfg, modules_to_wrap={BlockChunk}
+            )(self.teacher[k])

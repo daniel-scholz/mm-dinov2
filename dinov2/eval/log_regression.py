@@ -6,15 +6,18 @@
 
 import argparse
 import gc
+import json
 import logging
+import os
 import sys
 import time
 from typing import List, Optional
 
-from cuml.linear_model import LogisticRegression
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed
+import torchmetrics
+from cuml.linear_model import LogisticRegression
 from torch import nn
 from torch.utils.data import TensorDataset
 from torchmetrics import MetricTracker
@@ -27,7 +30,6 @@ from dinov2.eval.setup import get_args_parser as get_setup_args_parser
 from dinov2.eval.setup import setup_and_build_model
 from dinov2.eval.utils import evaluate, extract_features
 from dinov2.utils.dtype import as_torch_dtype
-
 
 logger = logging.getLogger("dinov2")
 
@@ -61,6 +63,20 @@ def get_args_parser(
         help="Validation dataset",
     )
     parser.add_argument(
+        "--test-dataset",
+        dest="test_dataset_str",
+        type=str,
+        help="Test dataset",
+        required=False,
+    )
+    parser.add_argument(
+        "--test-dataset",
+        dest="test_dataset_str",
+        type=str,
+        help="Test dataset",
+        required=False,
+    )
+    parser.add_argument(
         "--finetune-dataset-str",
         dest="finetune_dataset_str",
         type=str,
@@ -92,6 +108,9 @@ def get_args_parser(
         "--max-train-iters",
         type=int,
         help="Maximum number of train iterations (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--backbone", type=str, help="Backbone model to use", default="dinov2"
     )
     parser.set_defaults(
         train_dataset_str="ImageNet:split=TRAIN",
@@ -140,17 +159,31 @@ class LogRegModule(nn.Module):
         if self.device == _CPU_DEVICE:
             # both cuML and sklearn only work with numpy arrays on CPU
             train_features = train_features.numpy()
-            train_labels = train_labels.numpy()
+            train_labels = train_labels.numpy().astype(int)
         self.estimator.fit(train_features, train_labels)
 
 
-def evaluate_model(*, logreg_model, logreg_metric, test_data_loader, device):
+def evaluate_model(
+    *,
+    logreg_model,
+    logreg_metrics: torchmetrics.MetricCollection,
+    test_data_loader,
+    device,
+):
     postprocessors = {"metrics": logreg_model}
-    metrics = {"metrics": logreg_metric}
+    metrics = {"metrics": logreg_metrics}
     return evaluate(nn.Identity(), test_data_loader, postprocessors, metrics, device)
 
 
-def train_for_C(*, C, max_iter, train_features, train_labels, dtype=torch.float64, device=_CPU_DEVICE):
+def train_for_C(
+    *,
+    C,
+    max_iter,
+    train_features,
+    train_labels,
+    dtype=torch.float64,
+    device=_CPU_DEVICE,
+):
     logreg_model = LogRegModule(C, max_iter=max_iter, dtype=dtype, device=device)
     logreg_model.fit(train_features, train_labels)
     return logreg_model
@@ -162,11 +195,12 @@ def train_and_evaluate(
     max_iter,
     train_features,
     train_labels,
-    logreg_metric,
+    logreg_metrics: torchmetrics.MetricCollection,
     test_data_loader,
     train_dtype=torch.float64,
     train_features_device,
     eval_device,
+    mri_sequences=None,
 ):
     logreg_model = train_for_C(
         C=C,
@@ -178,7 +212,7 @@ def train_and_evaluate(
     )
     return evaluate_model(
         logreg_model=logreg_model,
-        logreg_metric=logreg_metric,
+        logreg_metrics=logreg_metrics,
         test_data_loader=test_data_loader,
         device=eval_device,
     )
@@ -234,7 +268,7 @@ def sweep_C_values(
         C = ALL_C[i].item()
         evals = evaluate_model(
             logreg_model=logreg_models_gathered[C],
-            logreg_metric=metric_tracker,
+            logreg_metrics=metric_tracker,
             test_data_loader=test_data_loader,
             device=torch.cuda.current_device(),
         )
@@ -242,7 +276,8 @@ def sweep_C_values(
 
         best_stats, which_epoch = metric_tracker.best_metric(return_step=True)
         best_stats_100 = {k: 100.0 * v for k, v in best_stats.items()}
-        if which_epoch["top-1"] == i:
+        best_key = list(best_stats.keys())[0]
+        if which_epoch[best_key] == i:
             best_C = C
     logger.info(f"Sweep best {best_stats_100}, best C = {best_C:.6f}")
 
@@ -255,13 +290,16 @@ def eval_log_regression(
     train_dataset,
     val_dataset,
     finetune_dataset,
-    metric_type,
+    train_features=None,
+    train_labels=None,
+    metric_types: List[MetricType],
     batch_size,
     num_workers,
     finetune_on_val=False,
     train_dtype=torch.float64,
     train_features_device=_CPU_DEVICE,
     max_train_iters=DEFAULT_MAX_ITER,
+    mri_sequences=None,
 ):
     """
     Implements the "standard" process for log regression evaluation:
@@ -274,14 +312,26 @@ def eval_log_regression(
 
     start = time.time()
 
-    train_features, train_labels = extract_features(
-        model, train_dataset, batch_size, num_workers, gather_on_cpu=(train_features_device == _CPU_DEVICE)
-    )
+    if train_features is None:
+        train_features, train_labels = extract_features(
+            model,
+            train_dataset,
+            batch_size,
+            num_workers,
+            gather_on_cpu=(train_features_device == _CPU_DEVICE),
+            mri_sequences=mri_sequences,
+        )
     val_features, val_labels = extract_features(
-        model, val_dataset, batch_size, num_workers, gather_on_cpu=(train_features_device == _CPU_DEVICE)
+        model,
+        val_dataset,
+        batch_size,
+        num_workers,
+        gather_on_cpu=(train_features_device == _CPU_DEVICE),
+        mri_sequences=mri_sequences,
     )
+    val_features_cls = val_features[:, 0]
     val_data_loader = torch.utils.data.DataLoader(
-        TensorDataset(val_features, val_labels),
+        TensorDataset(val_features_cls, val_labels),
         batch_size=batch_size,
         drop_last=False,
         num_workers=0,
@@ -294,22 +344,41 @@ def eval_log_regression(
     elif finetune_dataset is None and not finetune_on_val:
         logger.info("Choosing hyperparameters on 10% of the train dataset")
         torch.manual_seed(0)
+
         indices = torch.randperm(len(train_features), device=train_features.device)
         finetune_index = indices[: len(train_features) // 10]
         train_index = indices[len(train_features) // 10 :]
-        finetune_features, finetune_labels = train_features[finetune_index], train_labels[finetune_index]
-        train_features, train_labels = train_features[train_index], train_labels[train_index]
+
+        finetune_features, finetune_labels = (
+            train_features[finetune_index],
+            train_labels[finetune_index],
+        )
+        train_features, train_labels = (
+            train_features[train_index],
+            train_labels[train_index],
+        )
+
     else:
         logger.info("Choosing hyperparameters on the finetune dataset")
         finetune_features, finetune_labels = extract_features(
-            model, finetune_dataset, batch_size, num_workers, gather_on_cpu=(train_features_device == _CPU_DEVICE)
+            model,
+            finetune_dataset,
+            batch_size,
+            num_workers,
+            gather_on_cpu=(train_features_device == _CPU_DEVICE),
+            mri_sequences=mri_sequences,
         )
+
     # release the model - free GPU memory
     del model
     gc.collect()
     torch.cuda.empty_cache()
+
+    train_features_cls = train_features[:, 0]
+    finetune_features_cls = finetune_features[:, 0]
+
     finetune_data_loader = torch.utils.data.DataLoader(
-        TensorDataset(finetune_features, finetune_labels),
+        TensorDataset(finetune_features_cls, finetune_labels),
         batch_size=batch_size,
         drop_last=False,
     )
@@ -318,14 +387,18 @@ def eval_log_regression(
         num_classes = train_labels.shape[1]
     else:
         num_classes = train_labels.max() + 1
+    num_classes = int(num_classes)
 
     logger.info("Using cuML for logistic regression")
+    logger.info(
+        f"Using metric {metric_types[0]} for determining the best hyperparameters"
+    )
 
     best_stats, best_C = sweep_C_values(
-        train_features=train_features,
+        train_features=train_features_cls,
         train_labels=train_labels,
         test_data_loader=finetune_data_loader,
-        metric_type=metric_type,
+        metric_type=metric_types[0],
         num_classes=num_classes,
         train_dtype=train_dtype,
         train_features_device=train_features_device,
@@ -334,21 +407,41 @@ def eval_log_regression(
 
     if not finetune_on_val:
         logger.info("Best parameter found, concatenating features")
-        train_features = torch.cat((train_features, finetune_features))
-        train_labels = torch.cat((train_labels, finetune_labels))
+        # undo index extraction, put finetune features back where they came from
+        train_features_all = torch.zeros(
+            (len(train_features) + len(finetune_features), *train_features[0].shape)
+        )
+        train_labels_all = torch.zeros(
+            len(train_labels) + len(finetune_labels), dtype=train_labels.dtype
+        )
+
+        train_features_all[train_index] = train_features
+        train_labels_all[train_index] = train_labels
+
+        train_features_all[finetune_index] = finetune_features
+        train_labels_all[finetune_index] = finetune_labels
+
+        # train_features = torch.cat((train_features, finetune_features))
+        # train_labels = torch.cat((train_labels, finetune_labels))
+        train_features = train_features_all
+        train_labels = train_labels_all
 
     logger.info("Training final model")
-    logreg_metric = build_metric(metric_type, num_classes=num_classes)
+    logreg_metrics = [build_metric(m, num_classes=num_classes) for m in metric_types]
+    logreg_metrics = torchmetrics.MetricCollection(
+        {k: v for metric in logreg_metrics for k, v in metric.items()}
+    )
     evals = train_and_evaluate(
         C=best_C,
         max_iter=max_train_iters,
-        train_features=train_features,
+        train_features=train_features_cls,
         train_labels=train_labels,
-        logreg_metric=logreg_metric.clone(),
+        logreg_metrics=logreg_metrics.clone(),
         test_data_loader=val_data_loader,
         eval_device=torch.cuda.current_device(),
         train_dtype=train_dtype,
         train_features_device=train_features_device,
+        mri_sequences=mri_sequences,
     )
 
     best_stats = evals[1]["metrics"]
@@ -356,84 +449,164 @@ def eval_log_regression(
     best_stats["best_C"] = best_C
 
     logger.info(f"Log regression evaluation done in {int(time.time() - start)}s")
-    return best_stats
+    return best_stats, train_features, train_labels, val_features, val_labels
 
 
 def eval_log_regression_with_model(
     model,
+    train_features=None,
+    train_labels=None,
     train_dataset_str="ImageNet:split=TRAIN",
     val_dataset_str="ImageNet:split=VAL",
     finetune_dataset_str=None,
     autocast_dtype=torch.float,
     finetune_on_val=False,
-    metric_type=MetricType.MEAN_ACCURACY,
+    metric_types: List[MetricType] = [MetricType.MEAN_ACCURACY],
     train_dtype=torch.float64,
     train_features_device=_CPU_DEVICE,
     max_train_iters=DEFAULT_MAX_ITER,
+    num_workers=0,
+    mri_sequences=None,
 ):
     cudnn.benchmark = True
 
-    transform = make_classification_eval_transform(resize_size=224)
+    transform = make_classification_eval_transform(
+        resize_size=224, mean=(0.45), std=(0.225)
+    )
     target_transform = None
 
-    train_dataset = make_dataset(dataset_str=train_dataset_str, transform=transform, target_transform=target_transform)
-    val_dataset = make_dataset(dataset_str=val_dataset_str, transform=transform, target_transform=target_transform)
+    train_dataset = make_dataset(
+        dataset_str=train_dataset_str,
+        transform=transform,
+        target_transform=target_transform,
+    )
+    val_dataset = make_dataset(
+        dataset_str=val_dataset_str,
+        transform=transform,
+        target_transform=target_transform,
+    )
     if finetune_dataset_str is not None:
         finetune_dataset = make_dataset(
-            dataset_str=finetune_dataset_str, transform=transform, target_transform=target_transform
+            dataset_str=finetune_dataset_str,
+            transform=transform,
+            target_transform=target_transform,
         )
     else:
         finetune_dataset = None
 
     with torch.cuda.amp.autocast(dtype=autocast_dtype):
-        results_dict_logreg = eval_log_regression(
-            model=model,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            finetune_dataset=finetune_dataset,
-            metric_type=metric_type,
-            batch_size=256,
-            num_workers=0,  # 5,
-            finetune_on_val=finetune_on_val,
-            train_dtype=train_dtype,
-            train_features_device=train_features_device,
-            max_train_iters=max_train_iters,
+        results_dict_logreg, train_features, train_labels, val_features, val_labels = (
+            eval_log_regression(
+                train_features=train_features,
+                train_labels=train_labels,
+                model=model,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                finetune_dataset=finetune_dataset,
+                metric_types=metric_types,
+                batch_size=64,
+                num_workers=num_workers,
+                finetune_on_val=finetune_on_val,
+                train_dtype=train_dtype,
+                train_features_device=train_features_device,
+                max_train_iters=max_train_iters,
+                mri_sequences=mri_sequences,
+            )
         )
 
-    results_dict = {
-        "top-1": results_dict_logreg["top-1"].cpu().numpy() * 100.0,
-        "top-5": results_dict_logreg.get("top-5", torch.tensor(0.0)).cpu().numpy() * 100.0,
-        "best_C": results_dict_logreg["best_C"],
-    }
+    results_dict = format_results_logreg(results_dict_logreg)
+
+    eval_split = next(
+        part.split("=")[1] for part in val_dataset_str.split(":") if "split=" in part
+    )
     logger.info(
         "\n".join(
             [
                 "Training of the supervised logistic regression on frozen features completed.\n"
-                "Top-1 test accuracy: {acc:.1f}".format(acc=results_dict["top-1"]),
-                "Top-5 test accuracy: {acc:.1f}".format(acc=results_dict["top-5"]),
+                f"{json.dumps(results_dict, indent=2)}",
                 "obtained for C = {c:.6f}".format(c=results_dict["best_C"]),
+                f"on the {eval_split} split.",
             ]
         )
     )
 
     torch.distributed.barrier()
+    return (
+        results_dict,
+        train_features,
+        train_labels,
+        val_features,
+        val_labels,
+    )
+
+
+def format_results_logreg(results_dict_logreg: dict) -> dict:
+    results_dict = {"best_C": results_dict_logreg["best_C"]}
+    for k, v in results_dict_logreg.items():
+        if k != "best_C":
+            if isinstance(v, torch.Tensor):
+                if v.dim() == 0:
+                    v = v.item()
+                    results_dict[k] = v
+                else:
+                    _v = {f"{k}.{kk}": vv.item() for kk, vv in enumerate(v)}
+                    results_dict[k] = v.mean().item()
+                    results_dict.update(_v)
+
+            elif isinstance(v, dict):
+                # join the keys with a dot
+                v = {f"{k}.{kk}": vv.item() for kk, vv in v.items()}
+                results_dict.update(v)
     return results_dict
 
 
 def main(args):
-    model, autocast_dtype = setup_and_build_model(args)
-    eval_log_regression_with_model(
+    model, dataset_paths, autocast_dtype = setup_and_build_model(args)
+    train_str, val_str, test_str = dataset_paths
+
+    val_results_dict = eval_log_regression_with_model(
         model=model,
-        train_dataset_str=args.train_dataset_str,
-        val_dataset_str=args.val_dataset_str,
-        finetune_dataset_str=args.finetune_dataset_str,
+        train_dataset_str=train_str,
+        val_dataset_str=val_str,
+        finetune_dataset_str=None,
         autocast_dtype=autocast_dtype,
-        finetune_on_val=args.finetune_on_val,
-        metric_type=args.metric_type,
+        finetune_on_val=False,
+        metric_types=[
+            MetricType.MATTHEWS_CORRELATION_COEFFICIENT,
+            MetricType.MULTICLASS_AUROC,
+            args.metric_type,
+        ],
         train_dtype=as_torch_dtype(args.train_dtype),
         train_features_device=torch.device(args.train_features_device),
         max_train_iters=args.max_train_iters,
     )
+    test_results_dict = {}
+    if test_str is not None:
+        test_results_dict = eval_log_regression_with_model(
+            model=model,
+            train_dataset_str=train_str,
+            val_dataset_str=test_str,
+            finetune_dataset_str=args.finetune_dataset_str,
+            autocast_dtype=autocast_dtype,
+            finetune_on_val=False,
+            metric_types=[
+                MetricType.MATTHEWS_CORRELATION_COEFFICIENT,
+                MetricType.MULTICLASS_AUROC,
+                args.metric_type,
+            ],
+            train_dtype=as_torch_dtype(args.train_dtype),
+            train_features_device=torch.device(args.train_features_device),
+            max_train_iters=args.max_train_iters,
+        )
+    results_dict = {"val": val_results_dict, "test": test_results_dict}
+    logger.info(f"Results at manual evaluation: {results_dict}")
+
+    eval_dir = os.path.join(args.output_dir, "eval", "manual")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    with open(os.path.join(eval_dir, "results.json"), "w") as f:
+        json.dump(results_dict, f, indent=2)
+
     return 0
 
 

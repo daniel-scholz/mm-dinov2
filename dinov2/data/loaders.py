@@ -11,10 +11,11 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import (NIHChestXray, ImageNet, ImageNet22k, MC, Shenzhen, SARSCoV2CT, BTCV, BrainTumor,
-                       BTCVSlice, MSDHeart, MSDHipp, MSDSpleen, AMOS, CheXpert)
+from .datasets import (
+    GliomaSSL,
+    GliomaSupervised,
+)
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
-
 
 logger = logging.getLogger("dinov2")
 
@@ -31,7 +32,10 @@ def _make_bool_str(b: bool) -> str:
     return "yes" if b else "no"
 
 
-def _make_sample_transform(image_transform: Optional[Callable] = None, target_transform: Optional[Callable] = None):
+def _make_sample_transform(
+    image_transform: Optional[Callable] = None,
+    target_transform: Optional[Callable] = None,
+):
     def transform(sample):
         image, target = sample
         if image_transform is not None:
@@ -51,40 +55,30 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        # assert key in ("root", "extra", "split") or (
+        # key in ["random_axes", "mri_sequences",""] and "glioma" in name.lower()
+        # )
+        # map boolean strings to actual booleans
+        if value.lower() == "true":
+            value = True
+        elif value.lower() == "false":
+            value = False
+        else:
+            # convert to float if number
+            try:
+                value = float(value)
+            except ValueError:
+                pass
+
         kwargs[key] = value
 
-    if name == "ImageNet":
-        class_ = ImageNet
-    elif name == "ImageNet22k":
-        class_ = ImageNet22k
-    elif name == "NIHChestXray":
-        class_ = NIHChestXray
-    elif name == "MC":
-        class_ = MC
-    elif name == "Shenzhen":
-        class_ = Shenzhen
-    elif name == "SARSCoV2CT":
-        class_ = SARSCoV2CT
-    elif name == "BTCV":
-        class_ = BTCV
-    elif name == "BrainTumor":
-        class_ = BrainTumor
-    elif name == "BTCVSlice":
-        class_ = BTCVSlice
-    elif name == "MSDHeart":
-        class_ = MSDHeart
-    elif name == "MSDHipp":
-        class_ = MSDHipp
-    elif name == "MSDSpleen":
-        class_ = MSDSpleen
-    elif name == "AMOS":
-        class_ = AMOS
-    elif name == "CheXpert":
-        class_ = CheXpert
+    if name == "GliomaSupervised":
+        class_ = GliomaSupervised
+    elif name == "GliomaSSL":
+        class_ = GliomaSSL
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
-    
+
     if "split" in kwargs:
         kwargs["split"] = class_.Split[kwargs["split"]]
 
@@ -236,7 +230,7 @@ def make_data_loader(
         sampler=sampler,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=False, # CHANGES
+        pin_memory=False,  # CHANGES
         drop_last=drop_last,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,

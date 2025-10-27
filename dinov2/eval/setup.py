@@ -5,25 +5,35 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
-from typing import Any, List, Optional, Tuple
 import os
+from typing import Any, List, Optional, Tuple
 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.backends.cudnn as cudnn
 
+import dinov2.utils.utils as dinov2_utils
+from dinov2.eval.utils import (
+    BiomedCLIPBase,
+    CLIPLarge,
+    ConvNextFromScratch,
+    DenseNet201ImageNet1k,
+    MAEViTLargeImagenet1k,
+    OpenCLIPHuge,
+    ResNet34FromScratch,
+    SAMLarge,
+    VGG19ImageNet1k,
+    ViTLargeImagenet21k,
+    ViTLargeMSN,
+)
 from dinov2.logging import logging
 from dinov2.models import build_model_from_cfg
 from dinov2.utils.config import setup
-import dinov2.utils.utils as dinov2_utils
-from dinov2.eval.utils import (ViTLargeImagenet21k, ResNet152ImageNet1k, VGG19ImageNet1k, DenseNet201ImageNet1k, SAMLarge,
-                               MAEViTLargeImagenet1k, CLIPLarge, OpenCLIPHuge, ViTLargeMSN, BiomedCLIPBase)
-from transformers import ViTForImageClassification
-
 
 logger = logging.getLogger("dinov2")
+
 
 def get_args_parser(
     description: Optional[str] = None,
@@ -61,7 +71,9 @@ def get_args_parser(
 
 
 def get_autocast_dtype(config):
-    teacher_dtype_str = config.compute_precision.teacher.backbone.mixed_precision.param_dtype
+    teacher_dtype_str = (
+        config.compute_precision.teacher.backbone.mixed_precision.param_dtype
+    )
     if teacher_dtype_str == "fp16":
         return torch.half
     elif teacher_dtype_str == "bf16":
@@ -71,12 +83,25 @@ def get_autocast_dtype(config):
 
 
 def build_model_for_eval(config, pretrained_weights, backbone):
+    mri_sequences = (
+        config.train.dataset_path.rsplit("mri_sequences=", 1)[1]
+        .split(":")[0]
+        .split(",")
+    )
+    in_channels = len(mri_sequences)
+
     if backbone == "vit-large-imagenet21k":
         model = ViTLargeImagenet21k()
         logger.info("Using vit-large-imagenet21k backbone")
     elif backbone == "resnet-152-imagenet1k":
         model = ResNet152ImageNet1k()
         logger.info("Using resnet-152-imagenet1k backbone")
+    elif backbone == "resnet-34-from-scratch":
+        model = ResNet34FromScratch(in_channels=in_channels)
+        logger.info("Using resnet-34-from-scratch backbone")
+    elif backbone == "convnext-from-scratch":
+        model = ConvNextFromScratch(in_channels=in_channels)
+        logger.info("Using convnext-from-scratch backbone")
     elif backbone == "vgg-19-imagenet1k":
         model = VGG19ImageNet1k()
         logger.info("Using vgg-19-imagenet1k backbone")
@@ -115,4 +140,12 @@ def setup_and_build_model(args) -> Tuple[Any, torch.dtype]:
     config = setup(args)
     model = build_model_for_eval(config, args.pretrained_weights, args.backbone)
     autocast_dtype = get_autocast_dtype(config)
-    return model, autocast_dtype
+    return (
+        model,
+        (
+            config.evaluation.train_dataset_path,
+            config.evaluation.val_dataset_path,
+            config.evaluation.test_dataset_path,
+        ),
+        autocast_dtype,
+    )
